@@ -1,0 +1,6 @@
+{
+    "ibft_n": 4,
+    "ibft_t": 1,
+    "ibft_start_time": 2000,
+    "ibft_timer_granularity": 100
+}

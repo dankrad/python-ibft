@@ -1,0 +1,26 @@
+[
+    {
+        "index": 0,
+        "public_key": "",
+        "url": "http://localhost:5000/",
+        "port": 5000
+    },
+    {
+        "index": 1,
+        "public_key": "",
+        "url": "http://localhost:5001/",
+        "port": 5001
+    },
+    {
+        "index": 2,
+        "public_key": "",
+        "url": "http://localhost:5002/",
+        "port": 5002
+    },
+    {
+        "index": 3,
+        "public_key": "",
+        "url": "http://localhost:5003/",
+        "port": 5003
+    }
+]
