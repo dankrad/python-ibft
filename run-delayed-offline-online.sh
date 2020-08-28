@@ -5,5 +5,5 @@ tmux \
   split-window "python ibft.py 1 --online-delayed; read" \; \
   split-window "python ibft.py 2 --online-delayed; read" \; \
   split-window "python ibft.py 3; read" \; \
-  split-window "bash start.sh; read" \; \
+  split-window "bash start.sh --retry; read" \; \
   select-layout tiled
