@@ -78,28 +78,27 @@ def ibft_timer():
 
     threading.Timer(ibft_timer_granularity / 1000, ibft_timer).start()
 
-ibft_instances = defaultdict(ibft_instance)
 
-api = Flask(__name__)
-
-@api.route('/start', methods=['POST'])
-def post_start():
-    msg = request.json
-    l = msg["lambda"]
-    if "decided" in ibft_instances[l]:
-        # TODO: Send deciding quorum to originating node
-        return make_response(jsonify(False), 400)   
-    value = msg["value"]
-    ibft_instances[l]["input_value"] = value
+def start_instance(instance_id, input_value):
+    l = instance_id
+    ibft_instances[l]["input_value"] = input_value
     ibft_instances[l]["timer"] = ibft_start_time
     if ibft_leader(l, 0) == ibft_id:
         broadcast_message = {"type": "pre-prepare",
                                "lambda": l,
                                "round": 0,
-                               "value": value}
+                               "value": input_value}
         ibft_send_messages(broadcast_message)
-    return make_response(jsonify(True), 200)
 
+
+def run_server():
+    ibft_timer()
+    _thread.start_new_thread(lambda: api.run(port=ibft_parties[ibft_id]["port"], threaded=False, processes=1), ())
+
+
+ibft_instances = defaultdict(ibft_instance)
+
+api = Flask(__name__)
 
 @api.route('/message', methods=['POST'])
 def post_message():
@@ -125,6 +124,8 @@ def post_message():
     if (not msg["type"] == "decide") and msg["round"] < ibft_instances[l]["round"]:
         return make_response(jsonify(False), 400)
     if msg["type"] == "pre-prepare":
+        if msg["round"] != ibft_instances[l]["round"]:
+            return make_response(jsonify(False), 400)
         print("Received pre-prepare")
         if msg["round"] > 0:
             # Check justification
@@ -161,6 +162,8 @@ def post_message():
                 "value": msg["value"]}
         ibft_send_messages(broadcast_message)
     elif msg["type"] == "prepare":
+        if msg["round"] != ibft_instances[l]["round"]:
+            return make_response(jsonify(False), 400)
         msg_tuple = json.dumps(msg)
         ibft_instances[l]["prepare_messages"][msg_tuple][sender] = signature
         if len(ibft_instances[l]["prepare_messages"][msg_tuple]) > 2 * ibft_t \
@@ -306,6 +309,8 @@ if __name__ == '__main__':
                         help='JSON configuration')
     parser.add_argument('--privkey', metavar='privkey_json', type=str, default="",
                         help='JSON configuration')
+    parser.add_argument('--input-value', metavar='input_value', type=str, default="",
+                        help='Use as input value')
     parser.add_argument("--offline",dest='offline',action='store_true', help="Defect mode: this process is offline.")
     parser.add_argument("--random-values",dest='random_values',action='store_true', help="Defect mode: this process will send random values in messages.")
     parser.add_argument("--online-delayed",dest='online_delayed',action='store_true', help="Defect mode: Only come online after 60 seconds.")
@@ -321,14 +326,14 @@ if __name__ == '__main__':
         privkey_json = json.load(open("privkey_{0}.json".format(ibft_id), "r"))
     else:
         privkey_json = json.load(open(args.privkey, "r"))
-    
+
     ibft_privkey = privkey_json["private_key"]
 
     if args.online_delayed:
         print("Waiting 60s to go online")
         time.sleep(60)
         print("Now online")
-    
+
     if args.offline_delayed:
         print("Will go offline after 60s")
         def go_offline():
@@ -348,8 +353,8 @@ if __name__ == '__main__':
     ibft_threshold_pubkey = get_aggregate_key({k: bytes.fromhex(v["public_key"][2:]) for k, v in enumerate(ibft_parties[:2 * ibft_t + 1])})
 
     if not args.offline:
-        ibft_timer()
-        api.run(port=ibft_parties[ibft_id]["port"], threaded=False, processes=1)
+        run_server()
+        start_instance(0, args.input_value)
     else:
         print("I'm offline, doing nothing")
         input()

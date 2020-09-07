@@ -1,9 +1,9 @@
 #!/bin/bash
 
 tmux \
-  new-session  "python ibft.py 0; read" \; \
-  split-window "python ibft.py 1; read" \; \
-  split-window "python ibft.py 2; read" \; \
-  split-window "python ibft.py 3; read" \; \
-  split-window "bash start.sh; read" \; \
+  new-session  "python ibft.py 0 --input-value 'decide this'; read" \; \
+  split-window "python ibft.py 1 --input-value 'decide this'; read" \; \
+  split-window "python ibft.py 2 --input-value 'decide this'; read" \; \
+  split-window "python ibft.py 3 --input-value 'decide this'; read" \; \
+  split-window "bash wait.sh" \; \
   select-layout tiled
