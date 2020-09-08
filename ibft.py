@@ -3,6 +3,7 @@ import requests
 from collections import defaultdict
 import sys, os
 import _thread, threading
+from queue import Queue
 import random
 import time
 import argparse
@@ -27,6 +28,8 @@ def ibft_send_messages(msg, endpoint="message", justification=None, destination_
                 msg_copy["value"] = str(random.randint(0, 10))
                 wrapped_message_copy = wrapped_message.copy()
                 wrapped_message_copy["message"] = msg_copy
+                signature = py_ecc_bls.Sign(ibft_privkey, bytes(json.dumps(msg_copy), encoding="utf=8"))
+                wrapped_message_copy["signature"] = "0x" + signature.hex()
                 _thread.start_new_thread(ibft_send_message, (party["url"] + endpoint, wrapped_message_copy))
                 continue
             _thread.start_new_thread(ibft_send_message, (party["url"] + endpoint, wrapped_message))
@@ -93,191 +96,212 @@ def start_instance(instance_id, input_value):
 
 def run_server():
     ibft_timer()
+    _thread.start_new_thread(ibft_process_events, ())
     _thread.start_new_thread(lambda: api.run(port=ibft_parties[ibft_id]["port"], threaded=False, processes=1), ())
 
 
 ibft_instances = defaultdict(ibft_instance)
+ibft_message_queue = Queue()
 
 api = Flask(__name__)
+
+def ibft_process_events():
+    while True:
+        wrapped_message = ibft_message_queue.get()
+        try:
+            msg = wrapped_message["message"]
+            sender = wrapped_message["sender"]
+            signature = wrapped_message["signature"]
+            if not py_ecc_bls.Verify(bytes.fromhex(ibft_parties[sender]["public_key"][2:]),
+                bytes(json.dumps(msg), encoding="utf-8"),
+                bytes.fromhex(signature[2:])):
+                print("Got message with invalid signature, ignored")
+                continue
+            l = msg["lambda"]
+            if "decided" in ibft_instances[l]:
+                if msg["type"] == "round-change":
+                    justification = {"message": ibft_instances[l]["decision_message"],
+                                "aggregate_signature": ibft_instances[l]["decision_signature"]}
+
+                    decision_message = {"type": "decide",
+                                    "lambda": l,
+                                    "value": ibft_instances[l]["decided"]}
+                    ibft_send_messages(decision_message, justification=justification, destination_party=sender)
+                    print("Got round change after deciding, sending quorum")
+                print("Got message after deciding, ignored")
+                continue
+            if msg["type"] == "pre-prepare":
+                if msg["round"] != ibft_instances[l]["round"]:
+                    print("Got pre-prepare for round {0} but current round is {1}, ignored".format(msg["round"], ibft_instances[l]["round"]))
+                    continue
+                print("Received pre-prepare")
+                if msg["round"] > 0:
+                    # Check justification
+                    # Check quorum of round-change messages included
+                    pr = None
+                    pv = None
+                    for m in wrapped_message["justification"]["round_change_messages"]:
+                        if not py_ecc_bls.Verify(bytes.fromhex(ibft_parties[m["sender"]]["public_key"][2:]),
+                                bytes(json.dumps(m["message"]), encoding="utf-8"),
+                                bytes.fromhex(m["signature"][2:])) or \
+                                not m["message"]["round"] >= msg["round"]:
+                            print("Bad pre-prepare justification, ignored")
+                            continue
+                        if m["message"]["prepared_round"] != None and (pr == None or m["message"]["prepared_round"] > pr):
+                            pr = m["message"]["prepared_round"]
+                            pv = m["message"]["prepared_value"]
+
+                    if pv != None and not pv == msg["value"]:
+                        print("Bad pre-prepare justification, ignored")
+                        continue
+
+                    if pr != None:
+                        # Quorum of pre-prepare messages included for highest prepared round
+                        if not (wrapped_message["justification"]["pre_prepare_messages"]["message"]["round"] == pr and \
+                                wrapped_message["justification"]["pre_prepare_messages"]["message"]["value"] == pv):
+                            print("Bad pre-prepare justification, ignored")
+                            continue
+
+                        if not py_ecc_bls.Verify(ibft_threshold_pubkey,
+                                            bytes(json.dumps(wrapped_message["justification"]["pre_prepare_messages"]["message"]), encoding="utf-8"),
+                                            bytes.fromhex(wrapped_message["justification"]["pre_prepare_messages"]["aggregate_signature"][2:])):
+                            print("Bad pre-prepare justification, ignored")
+                            continue
+
+                broadcast_message = {"type": "prepare",
+                        "lambda": l,
+                        "round": msg["round"],
+                        "value": msg["value"]}
+                ibft_send_messages(broadcast_message)
+            elif msg["type"] == "prepare":
+                if msg["round"] != ibft_instances[l]["round"]:
+                    return make_response(jsonify(False), 400)
+                msg_tuple = json.dumps(msg)
+                ibft_instances[l]["prepare_messages"][msg_tuple][sender] = signature
+                if len(ibft_instances[l]["prepare_messages"][msg_tuple]) > 2 * ibft_t \
+                    and not ibft_instances[l]["prepare_messages_quorum_achieved"][msg_tuple]:
+                    print("Received prepare quorum")
+                    ibft_instances[l]["prepare_messages_quorum_achieved"][msg_tuple] = True
+                    ibft_instances[l]["prepared_round"] = msg["round"]
+                    ibft_instances[l]["prepared_value"] = msg["value"]
+                    ibft_instances[l]["prepared_justification_message"] = msg
+                    if args.offline_after_prepare:
+                        print("Going offline")
+                        os._exit(0)
+                    broadcast_message = {"type": "commit",
+                    "lambda": msg["lambda"],
+                    "round": msg["round"],
+                    "value": msg["value"]}
+                    ibft_send_messages(broadcast_message)
+            elif msg["type"] == "commit":
+                msg_tuple = json.dumps(msg)
+                ibft_instances[l]["commit_messages"][msg_tuple][sender] = signature
+                if len(ibft_instances[l]["commit_messages"][msg_tuple]) > 2 * ibft_t  \
+                    and not ibft_instances[l]["commit_messages_quorum_achieved"][msg_tuple]:
+                    print("Received commit quorum")
+                    ibft_instances[l]["commit_messages_quorum_achieved"][msg_tuple] = True
+                    if "timer" in ibft_instances[l]:
+                        del ibft_instances[l]["timer"]
+                    ibft_instances[l]["decided"] = msg["value"]
+                    print("Decided on lambda={0}, value={1}".format(msg["lambda"], msg["value"]))
+
+                    ibft_instances[l]["decision_message"] = msg
+                    ibft_instances[l]["decision_signature"] = "0x" + reconstruct({k: bytes.fromhex(x[2:]) 
+                            for k, x in ibft_instances[l]["commit_messages"][msg_tuple].items()}).hex()
+
+            elif msg["type"] == "round-change":
+                if msg["prepared_round"] != None and not (msg["prepared_round"] < msg["round"]):
+                    return make_response(jsonify(False), 400)
+                if msg["prepared_round"] != None or msg["prepared_value"] != None:
+                    if msg["prepared_round"] != wrapped_message["justification"]["message"]["round"] or \
+                            msg["prepared_value"] != wrapped_message["justification"]["message"]["value"] or \
+                            wrapped_message["justification"]["message"]["type"] != "prepare":
+                        print("Bad round change justification, ignored")
+                        continue
+                    if not py_ecc_bls.Verify(ibft_threshold_pubkey,
+                                        bytes(json.dumps(wrapped_message["justification"]["message"]), encoding="utf-8"),
+                                        bytes.fromhex(wrapped_message["justification"]["aggregate_signature"][2:])):
+                        print("Bad round change justification, ignored")
+                        continue
+                    ibft_instances[l]["round_change_message_justifications"][json.dumps(msg)] = wrapped_message["justification"]
+
+                ibft_instances[l]["round_change_messages"][msg["round"]][sender] = {
+                            "sender": sender,
+                            "signature": signature,
+                            "message": msg}
+                maxround = max(ibft_instances[l]["round_change_messages"])
+                oldround = ibft_instances[l]["round"]
+                if maxround > ibft_instances[l]["round"]:
+                    msgset = {}
+                    for r in range(maxround, ibft_instances[l]["round"], -1):
+                        for s, m in ibft_instances[l]["round_change_messages"][r].items():
+                            if s not in msgset:
+                                msgset[s] = ibft_instances[l]["round_change_messages"][r][s]
+                        if len(msgset) > ibft_t:
+                            ibft_instances[l]["round"] = r
+                            ibft_instances[l]["timer"] = ibft_start_time * 2 ** r
+
+                            ibft_initiate_round_change(l)
+                            break
+                
+                if len(ibft_instances[l]["round_change_messages"][msg["round"]]) > 2 * ibft_t  \
+                    and ibft_leader(l, msg["round"]) == ibft_id \
+                    and not ibft_instances[l]["round_change_messages_quorum_achieved"][msg["round"]]:
+                    ibft_instances[l]["round_change_messages_quorum_achieved"][msg["round"]] = True
+                    print("Assuming leader for instance {0} round {1}".format(l, msg["round"]))
+
+                    pr = None
+                    pv = None
+                    pre_prepare_justification = None
+                    for m in ibft_instances[l]["round_change_messages"][msg["round"]].values():
+                        if m["message"]["prepared_round"] != None and (pr == None or m["message"]["prepared_round"] > pr):
+                            pr = m["message"]["prepared_round"]
+                            pv = m["message"]["prepared_value"]
+                            pre_prepare_justification = ibft_instances[l]["round_change_message_justifications"][json.dumps(m["message"])]
+
+                    if pv == None:
+                        if ibft_instances[l]["input_value"] == None:
+                            print("I have no input value. Not started, not assuming leadership")
+                            return make_response(jsonify(True), 200)
+                        pv = ibft_instances[l]["input_value"]
+
+                    broadcast_message = {"type": "pre-prepare",
+                                        "lambda": l,
+                                        "round": msg["round"],
+                                        "value": pv}
+
+                    justification = {"pre_prepare_messages": pre_prepare_justification,
+                                    "round_change_messages": list(ibft_instances[l]["round_change_messages"][msg["round"]].values())}
+
+                    ibft_send_messages(broadcast_message, justification=justification)
+            elif msg["type"] == "decide":
+                if wrapped_message["justification"]["message"]["type"] != "commit" or \
+                        msg["value"] != wrapped_message["justification"]["message"]["value"]:
+                    print("Bad decide justification, ignored")
+                    continue
+
+                if not py_ecc_bls.Verify(ibft_threshold_pubkey,
+                                    bytes(json.dumps(wrapped_message["justification"]["message"]), encoding="utf-8"),
+                                    bytes.fromhex(wrapped_message["justification"]["aggregate_signature"][2:])):
+                    print("Bad decide justification, ignored")
+                    continue
+                ibft_instances[l]["decided"] = msg["value"]
+                ibft_instances[l]["decision_message"] = wrapped_message["justification"]["message"]
+                ibft_instances[l]["decision_signature"] = wrapped_message["justification"]["aggregate_signature"]
+                if "timer" in ibft_instances[l]:
+                    del ibft_instances[l]["timer"]
+                print("Decided via 'decide' message on lambda={0}, value={1}".format(l, msg["value"]))
+            else:
+                print("Bad message type, ignored")
+                continue
+        except:
+            print("Error processing message, ignored")
 
 @api.route('/message', methods=['POST'])
 def post_message():
     wrapped_message = request.json
-    msg = wrapped_message["message"]
-    sender = wrapped_message["sender"]
-    signature = wrapped_message["signature"]
-    if not py_ecc_bls.Verify(bytes.fromhex(ibft_parties[sender]["public_key"][2:]),
-        bytes(json.dumps(msg), encoding="utf-8"),
-        bytes.fromhex(signature[2:])):
-        return make_response(jsonify(False), 400)
-    l = msg["lambda"]
-    if "decided" in ibft_instances[l]:
-        if msg["type"] == "round-change":
-            justification = {"message": ibft_instances[l]["decision_message"],
-                         "aggregate_signature": ibft_instances[l]["decision_signature"]}
-
-            decision_message = {"type": "decide",
-                            "lambda": l,
-                            "value": ibft_instances[l]["decided"]}
-            ibft_send_messages(decision_message, justification=justification, destination_party=sender)
-        return make_response(jsonify(False), 400)
-    if (not msg["type"] == "decide") and msg["round"] < ibft_instances[l]["round"]:
-        return make_response(jsonify(False), 400)
-    if msg["type"] == "pre-prepare":
-        if msg["round"] != ibft_instances[l]["round"]:
-            return make_response(jsonify(False), 400)
-        print("Received pre-prepare")
-        if msg["round"] > 0:
-            # Check justification
-            # Check quorum of round-change messages included
-            pr = None
-            pv = None
-            for m in wrapped_message["justification"]["round_change_messages"]:
-                if not py_ecc_bls.Verify(bytes.fromhex(ibft_parties[m["sender"]]["public_key"][2:]),
-                    bytes(json.dumps(m["message"]), encoding="utf-8"),
-                    bytes.fromhex(m["signature"][2:])) or \
-                        not m["message"]["round"] >= msg["round"]:
-                    return make_response(jsonify(False), 400)
-                if m["message"]["prepared_round"] != None and (pr == None or m["message"]["prepared_round"] > pr):
-                    pr = m["message"]["prepared_round"]
-                    pv = m["message"]["prepared_value"]
-
-            if pv != None and not pv == msg["value"]:
-                return make_response(jsonify(False), 400)
-
-            if pr != None:
-                # Quorum of pre-prepare messages included for highest prepared round
-                if not (wrapped_message["justification"]["pre_prepare_messages"]["message"]["round"] == pr and \
-                        wrapped_message["justification"]["pre_prepare_messages"]["message"]["value"] == pv):
-                    return make_response(jsonify(False), 400)
-
-                if not py_ecc_bls.Verify(ibft_threshold_pubkey,
-                                    bytes(json.dumps(wrapped_message["justification"]["pre_prepare_messages"]["message"]), encoding="utf-8"),
-                                    bytes.fromhex(wrapped_message["justification"]["pre_prepare_messages"]["aggregate_signature"][2:])):
-                    return make_response(jsonify(False), 400)
-
-        broadcast_message = {"type": "prepare",
-                "lambda": l,
-                "round": msg["round"],
-                "value": msg["value"]}
-        ibft_send_messages(broadcast_message)
-    elif msg["type"] == "prepare":
-        if msg["round"] != ibft_instances[l]["round"]:
-            return make_response(jsonify(False), 400)
-        msg_tuple = json.dumps(msg)
-        ibft_instances[l]["prepare_messages"][msg_tuple][sender] = signature
-        if len(ibft_instances[l]["prepare_messages"][msg_tuple]) > 2 * ibft_t \
-            and not ibft_instances[l]["prepare_messages_quorum_achieved"][msg_tuple]:
-            print("Received prepare quorum")
-            ibft_instances[l]["prepare_messages_quorum_achieved"][msg_tuple] = True
-            ibft_instances[l]["prepared_round"] = msg["round"]
-            ibft_instances[l]["prepared_value"] = msg["value"]
-            ibft_instances[l]["prepared_justification_message"] = msg
-            if args.offline_after_prepare:
-                print("Going offline")
-                os._exit(0)
-            broadcast_message = {"type": "commit",
-               "lambda": msg["lambda"],
-               "round": msg["round"],
-               "value": msg["value"]}
-            ibft_send_messages(broadcast_message)
-    elif msg["type"] == "commit":
-        msg_tuple = json.dumps(msg)
-        ibft_instances[l]["commit_messages"][msg_tuple][sender] = signature
-        if len(ibft_instances[l]["commit_messages"][msg_tuple]) > 2 * ibft_t  \
-            and not ibft_instances[l]["commit_messages_quorum_achieved"][msg_tuple]:
-            print("Received commit quorum")
-            ibft_instances[l]["commit_messages_quorum_achieved"][msg_tuple] = True
-            if "timer" in ibft_instances[l]:
-                del ibft_instances[l]["timer"]
-            ibft_instances[l]["decided"] = msg["value"]
-            print("Decided on lambda={0}, value={1}".format(msg["lambda"], msg["value"]))
-
-            ibft_instances[l]["decision_message"] = msg
-            ibft_instances[l]["decision_signature"] = "0x" + reconstruct({k: bytes.fromhex(x[2:]) 
-                    for k, x in ibft_instances[l]["commit_messages"][msg_tuple].items()}).hex()
-
-    elif msg["type"] == "round-change":
-        if msg["prepared_round"] != None and not (msg["prepared_round"] < msg["round"]):
-            return make_response(jsonify(False), 400)
-        if msg["prepared_round"] != None or msg["prepared_value"] != None:
-            if msg["prepared_round"] != wrapped_message["justification"]["message"]["round"] or \
-                msg["prepared_value"] != wrapped_message["justification"]["message"]["value"] or \
-                wrapped_message["justification"]["message"]["type"] != "prepare":
-                return make_response(jsonify(False), 400)
-            if not py_ecc_bls.Verify(ibft_threshold_pubkey,
-                                bytes(json.dumps(wrapped_message["justification"]["message"]), encoding="utf-8"),
-                                bytes.fromhex(wrapped_message["justification"]["aggregate_signature"][2:])):
-                return make_response(jsonify(False), 400)
-            ibft_instances[l]["round_change_message_justifications"][json.dumps(msg)] = wrapped_message["justification"]
-
-        ibft_instances[l]["round_change_messages"][msg["round"]][sender] = {
-                    "sender": sender,
-                    "signature": signature,
-                    "message": msg}
-        maxround = max(ibft_instances[l]["round_change_messages"])
-        oldround = ibft_instances[l]["round"]
-        if maxround > ibft_instances[l]["round"]:
-            msgset = {}
-            for r in range(maxround, ibft_instances[l]["round"], -1):
-                for s, m in ibft_instances[l]["round_change_messages"][r].items():
-                    if s not in msgset:
-                        msgset[s] = ibft_instances[l]["round_change_messages"][r][s]
-                if len(msgset) > ibft_t:
-                    ibft_instances[l]["round"] = r
-                    ibft_instances[l]["timer"] = ibft_start_time * 2 ** r
-
-                    ibft_initiate_round_change(l)
-                    break
-        
-        if len(ibft_instances[l]["round_change_messages"][msg["round"]]) > 2 * ibft_t  \
-            and ibft_leader(l, msg["round"]) == ibft_id \
-            and not ibft_instances[l]["round_change_messages_quorum_achieved"][msg["round"]]:
-            ibft_instances[l]["round_change_messages_quorum_achieved"][msg["round"]] = True
-            print("Assuming leader for instance {0} round {1}".format(l, msg["round"]))
-
-            pr = None
-            pv = None
-            pre_prepare_justification = None
-            for m in ibft_instances[l]["round_change_messages"][msg["round"]].values():
-                if m["message"]["prepared_round"] != None and (pr == None or m["message"]["prepared_round"] > pr):
-                    pr = m["message"]["prepared_round"]
-                    pv = m["message"]["prepared_value"]
-                    pre_prepare_justification = ibft_instances[l]["round_change_message_justifications"][json.dumps(m["message"])]
-
-            if pv == None:
-                if ibft_instances[l]["input_value"] == None:
-                    print("I have no input value. Not started, not assuming leadership")
-                    return make_response(jsonify(True), 200)
-                pv = ibft_instances[l]["input_value"]
-
-            broadcast_message = {"type": "pre-prepare",
-                                   "lambda": l,
-                                   "round": msg["round"],
-                                   "value": pv}
-
-            justification = {"pre_prepare_messages": pre_prepare_justification,
-                             "round_change_messages": list(ibft_instances[l]["round_change_messages"][msg["round"]].values())}
-
-            ibft_send_messages(broadcast_message, justification=justification)
-    elif msg["type"] == "decide":
-        if wrapped_message["justification"]["message"]["type"] != "commit" or \
-            msg["value"] != wrapped_message["justification"]["message"]["value"]:
-            return make_response(jsonify(False), 400)
-        if not py_ecc_bls.Verify(ibft_threshold_pubkey,
-                            bytes(json.dumps(wrapped_message["justification"]["message"]), encoding="utf-8"),
-                            bytes.fromhex(wrapped_message["justification"]["aggregate_signature"][2:])):
-            return make_response(jsonify(False), 400)
-        ibft_instances[l]["decided"] = msg["value"]
-        ibft_instances[l]["decision_message"] = wrapped_message["justification"]["message"]
-        ibft_instances[l]["decision_signature"] = wrapped_message["justification"]["aggregate_signature"]
-        if "timer" in ibft_instances[l]:
-            del ibft_instances[l]["timer"]
-        print("Decided via 'decide' message on lambda={0}, value={1}".format(l, msg["value"]))
-    else:
-        return make_response(jsonify(False), 400)
+    ibft_message_queue.put(wrapped_message)
     return make_response(jsonify(True), 200)
-    
 
 @api.route('/instances', methods=['GET'])
 def get_instances():
