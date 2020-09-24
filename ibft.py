@@ -7,7 +7,10 @@ from queue import Queue
 import random
 import time
 import argparse
-from bls_threshold import py_ecc_bls, reconstruct, get_aggregate_key
+if __name__ == '__main__':
+    from bls_threshold import py_ecc_bls, reconstruct, get_aggregate_key
+else:
+    from .bls_threshold import py_ecc_bls, reconstruct, get_aggregate_key
 
 def ibft_leader(l, r):
     return (l + r) % ibft_n
@@ -18,12 +21,15 @@ def ibft_send_message(url, msg):
     except:
         pass
 
-def ibft_send_messages(msg, endpoint="message", justification=None, destination_party=None):
+def send_broadcast(msg):
+    ibft_send_messages(msg, is_broadcast=True)
+
+def ibft_send_messages(msg, endpoint="message", justification=None, destination_party=None, is_broadcast=False):
     signature = py_ecc_bls.Sign(ibft_privkey, bytes(json.dumps(msg), encoding="utf=8"))
-    wrapped_message = {"message": msg, "sender": ibft_id, "signature": "0x" + signature.hex(), "justification": justification}
+    wrapped_message = {"message": msg, "sender": ibft_id, "signature": "0x" + signature.hex(), "justification": justification, "broadcast": is_broadcast}
     for i, party in enumerate(ibft_parties):
         if destination_party == None or destination_party == i:
-            if args.random_values and "value" in msg:
+            if __name__ == '__main__' and args.random_values and "value" in msg:
                 msg_copy = msg.copy()
                 msg_copy["value"] = str(random.randint(0, 10))
                 wrapped_message_copy = wrapped_message.copy()
@@ -82,10 +88,12 @@ def ibft_timer():
     threading.Timer(ibft_timer_granularity / 1000, ibft_timer).start()
 
 
-def start_instance(instance_id, input_value):
+def start_instance(instance_id, input_value, validity_callback=None, decision_callback=None):
     l = instance_id
     ibft_instances[l]["input_value"] = input_value
     ibft_instances[l]["timer"] = ibft_start_time
+    ibft_instances[l]["validity_callback"] = validity_callback
+    ibft_instances[l]["decision_callback"] = decision_callback
     if ibft_leader(l, 0) == ibft_id:
         broadcast_message = {"type": "pre-prepare",
                                "lambda": l,
@@ -102,6 +110,7 @@ def run_server():
 
 ibft_instances = defaultdict(ibft_instance)
 ibft_message_queue = Queue()
+broadcast_callback = None
 
 api = Flask(__name__)
 
@@ -116,6 +125,10 @@ def ibft_process_events():
                 bytes(json.dumps(msg), encoding="utf-8"),
                 bytes.fromhex(signature[2:])):
                 print("Got message with invalid signature, ignored")
+                continue
+            if wrapped_message["broadcast"]:
+                if broadcast_callback != None:
+                    broadcast_callback(wrapped_message["message"], wrapped_message["sender"])
                 continue
             l = msg["lambda"]
             if "decided" in ibft_instances[l]:
@@ -175,7 +188,8 @@ def ibft_process_events():
                 ibft_send_messages(broadcast_message)
             elif msg["type"] == "prepare":
                 if msg["round"] != ibft_instances[l]["round"]:
-                    return make_response(jsonify(False), 400)
+                    print("Got pre-prepare for round {0} but current round is {1}, ignored".format(msg["round"], ibft_instances[l]["round"]))
+                    continue
                 msg_tuple = json.dumps(msg)
                 ibft_instances[l]["prepare_messages"][msg_tuple][sender] = signature
                 if len(ibft_instances[l]["prepare_messages"][msg_tuple]) > 2 * ibft_t \
@@ -185,7 +199,7 @@ def ibft_process_events():
                     ibft_instances[l]["prepared_round"] = msg["round"]
                     ibft_instances[l]["prepared_value"] = msg["value"]
                     ibft_instances[l]["prepared_justification_message"] = msg
-                    if args.offline_after_prepare:
+                    if __name__ == '__main__' and args.offline_after_prepare:
                         print("Going offline")
                         os._exit(0)
                     broadcast_message = {"type": "commit",
@@ -204,6 +218,8 @@ def ibft_process_events():
                         del ibft_instances[l]["timer"]
                     ibft_instances[l]["decided"] = msg["value"]
                     print("Decided on lambda={0}, value={1}".format(msg["lambda"], msg["value"]))
+                    if ibft_instances[l]["decision_callback"] != None:
+                        ibft_instances[l]["decision_callback"](msg["value"])
 
                     ibft_instances[l]["decision_message"] = msg
                     ibft_instances[l]["decision_signature"] = "0x" + reconstruct({k: bytes.fromhex(x[2:]) 
@@ -291,6 +307,8 @@ def ibft_process_events():
                 if "timer" in ibft_instances[l]:
                     del ibft_instances[l]["timer"]
                 print("Decided via 'decide' message on lambda={0}, value={1}".format(l, msg["value"]))
+                if ibft_instances[l]["decision_callback"] != None:
+                    ibft_instances[l]["decision_callback"](msg["value"])
             else:
                 print("Bad message type, ignored")
                 continue
@@ -323,6 +341,26 @@ def get_parties():
 def get_id():
     return make_response(jsonify(ibft_id), 200)
 
+def load_config(parties_file, config_file, privkey_file, process_id):
+    global ibft_id, ibft_parties, ibft_t, ibft_n, ibft_start_time, ibft_timer_granularity, ibft_threshold_pubkey, ibft_privkey
+
+    ibft_id = process_id
+
+    privkey_json = json.load(open(privkey_file, "r"))
+
+    ibft_privkey = privkey_json["private_key"]
+
+    ibft_parties = json.load(open(parties_file, "r"))
+    ibft_config = json.load(open(config_file, "r"))
+
+    ibft_t = ibft_config["ibft_t"]
+    ibft_n = ibft_config["ibft_n"]
+
+    ibft_start_time = ibft_config["ibft_start_time"] # Milliseconds
+    ibft_timer_granularity = ibft_config["ibft_timer_granularity"]
+    ibft_threshold_pubkey = get_aggregate_key({k: bytes.fromhex(v["public_key"][2:]) for k, v in enumerate(ibft_parties[:2 * ibft_t + 1])})
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run Istanbul BFT process.')
     parser.add_argument('process_id', metavar='process_id', type=int, 
@@ -346,13 +384,6 @@ if __name__ == '__main__':
     ibft_id = args.process_id
     print("I am IBFT process {0}".format(ibft_id))
 
-    if args.privkey == "":
-        privkey_json = json.load(open("privkey_{0}.json".format(ibft_id), "r"))
-    else:
-        privkey_json = json.load(open(args.privkey, "r"))
-
-    ibft_privkey = privkey_json["private_key"]
-
     if args.online_delayed:
         print("Waiting 60s to go online")
         time.sleep(60)
@@ -366,15 +397,12 @@ if __name__ == '__main__':
 
         threading.Timer(60, go_offline).start()
 
-    ibft_parties = json.load(open(args.parties, "r"))
-    ibft_config = json.load(open(args.config, "r"))
+    if args.privkey == "":
+        privkey_file = "privkey_{0}.json".format(ibft_id)
+    else:
+        privkey_file = args.privkey
 
-    ibft_t = ibft_config["ibft_t"]
-    ibft_n = ibft_config["ibft_n"]
-
-    ibft_start_time = ibft_config["ibft_start_time"] # Milliseconds
-    ibft_timer_granularity = ibft_config["ibft_timer_granularity"]
-    ibft_threshold_pubkey = get_aggregate_key({k: bytes.fromhex(v["public_key"][2:]) for k, v in enumerate(ibft_parties[:2 * ibft_t + 1])})
+    load_config(args.parties, args.config, privkey_file, ibft_id)
 
     if not args.offline:
         run_server()
