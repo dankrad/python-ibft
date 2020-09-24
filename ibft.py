@@ -92,6 +92,7 @@ def start_instance(instance_id, input_value, validity_callback=None, decision_ca
     l = instance_id
     ibft_instances[l]["input_value"] = input_value
     ibft_instances[l]["timer"] = ibft_start_time
+    # TODO: Implement validity callback!
     ibft_instances[l]["validity_callback"] = validity_callback
     ibft_instances[l]["decision_callback"] = decision_callback
     if ibft_leader(l, 0) == ibft_id:
@@ -259,7 +260,7 @@ def ibft_process_events():
 
                             ibft_initiate_round_change(l)
                             break
-                
+
                 if len(ibft_instances[l]["round_change_messages"][msg["round"]]) > 2 * ibft_t  \
                     and ibft_leader(l, msg["round"]) == ibft_id \
                     and not ibft_instances[l]["round_change_messages_quorum_achieved"][msg["round"]]:
